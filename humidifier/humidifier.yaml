@@ -334,7 +334,7 @@ text_sensor:
       std::sprintf(&output[0], format, days, hours, mins, secs);
       return {output};
   - platform: template
-    name: "SALON Nawilżacz (status)"
+    name: "Status"
     id: modeTextSensor
     
 
@@ -675,13 +675,13 @@ interval:
 
 binary_sensor:
   - platform: template
-    name: "SALON Nawilżacz alert wody"
+    name: "Alert: Efficiency low"
     id: hum_dry_alert
   - platform: template
-    name: "SALON Nawilżacz alert poziomu"
+    name: "Alert: Water level low"
     id: hum_watertank_alert
   - platform: template
-    name: "SALON Nawilżacz alert wilgotności"
+    name: "Alert: Humidity too high"
     id: hum_mold_alert
   - platform: gpio
     pin: 
@@ -690,7 +690,6 @@ binary_sensor:
         input: true
         pullup: true
       inverted: true
-    name: "SALON Nawilżacz (pstryczek)"
     internal: true
     filters:
       - delayed_off: 50ms
@@ -1284,45 +1283,45 @@ script:
     then:
       - lambda: |-
           int newMode = id(hum_mode);
-          std::string modeText="nieznany";
+          std::string modeText="unknown";
 
           switch(newMode){
             case 0: // OFF
-              modeText="Wyłączony"; break;
+              modeText="Off"; break;
             case 1: // RUNNING_PID
             case 6: // KICKSTART
-              modeText="Nawilżanie"; 
+              modeText="Humidifying"; 
               if(id(switch_nighttime).state){
-                modeText.append(" (cisza nocna)"); 
+                modeText.append(" (night time)"); 
               }
 
               break;
             case 2: // STOPPED_PID
               if(id(switch_dnd).state)
-                modeText="Stop: cisza w domu";
+                modeText="Stop: do not disturb";
               else
-                modeText="Stop: powietrze nasycone";
+                modeText="Stop: air saturated";
               break;
             case 3: // COOLDOWN
-              modeText="Pauza: krótka przerwa"; break;
+              modeText="Pause: cooldown break"; break;
             case 4: // MOLD
-              modeText="Wymuszone: wietrzenie p/w pleśni"; break;
+              modeText="Forced: mold protection"; break;
             case 5: // STOPPED_DRY
-              modeText="Pauza: kalibracja"; break;
+              modeText="Pause: calibration"; break;
             case 7: // OFFLINE
               modeText="Offline"; break;
             case 8: // STOPPED_EMPTY
-              modeText="Stop: pusty zbiornik"; break;
+              modeText="Stop: tank empty"; break;
             case 9: // MOLD_FULL_DRYING
-              modeText="Osuszanie";
+              modeText="Drying";
               switch(id(hum_drying_mode)){
                 case 1: //DRYING_RUNNING
                 case 2: //DRYING_DELAYED_FINISHING
                   break;
                 case 3: //DRYING_COOLDOWN               
-                  modeText.append(": przerwa - kalibracja"); break;
+                  modeText.append(": break - calibration"); break;
                 case 0: //DRYING_DONE
-                  modeText.append(": zakończone"); break;
+                  modeText.append(": finished"); break;
               }
               break;
             
