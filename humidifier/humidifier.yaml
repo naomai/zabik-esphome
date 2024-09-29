@@ -1,0 +1,1331 @@
+esphome:
+  name: esp-humidifier 
+  on_boot:
+    priority: -100.0 
+    then:
+      - sensor.template.publish:
+          id: dry_air_temperature
+          state: 0.0
+      - binary_sensor.template.publish:
+          id: hum_dry_alert
+          state: false
+      - binary_sensor.template.publish:
+          id: hum_watertank_alert
+          state: false
+      - lambda: |-
+          if(id(first_boot)){
+
+          } 
+          id(first_boot) = false;
+      - script.execute: update_waterlevel
+
+esp8266:
+  board: d1_mini_lite
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+substitutions:
+  # HASS entity IDs for humidity and temperature
+  attach_hum_sensor: sensor.living_room_humidity
+  attach_temp_sensor: sensor.living_room_temperature
+
+
+
+logger:
+  level: INFO
+
+api:
+  password: ""
+  id: hass_api
+  reboot_timeout: 0s
+  services:
+  - service: reset_watertank
+    then:
+      - lambda: |-
+          id(button_reset)->execute();
+  - service: beep
+    then:
+      - lambda: |-
+          id(chime_warning)->execute();
+          
+
+  
+
+ota:
+  platform: "esphome"
+  password: ""
+  on_begin:
+    then:
+      - lambda: |-
+          id(ota_in_progress) = true;
+          id(led_indicator_r).turn_on();
+          id(led_indicator_b).turn_off();
+          id(fan_pwm_output).set_frequency(50.0);
+          id(fan_pwm_output).turn_off();
+
+
+
+
+globals:
+  - id: hum_mode
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: hum_drying_mode
+    type: int
+    restore_value: no
+    initial_value: '0'
+  
+  - id: kickstart
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: hum_request_update
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: hum_pid_params_changed
+    type: bool
+    restore_value: no
+    initial_value: 'true'
+  - id: hum_pid_integral
+    type: double
+    restore_value: no
+    initial_value: '0.0'
+  - id: hum_pid_error
+    type: double
+    restore_value: no
+    initial_value: '0.0'
+  - id: hum_pid_error_prev
+    type: double
+    restore_value: no
+    initial_value: '0.0'
+
+
+  - id: hum_interval_counter
+    type: double
+    restore_value: no
+    initial_value: '0'
+  - id: hum_warmup_counter
+    type: double
+    restore_value: no
+    initial_value: '600.0'
+  - id: hum_saturation_counter
+    type: double
+    restore_value: no
+    initial_value: '10800.0'
+  - id: hum_cooldown_counter
+    type: double
+    restore_value: no
+    initial_value: '0'
+  - id: hum_dry_counter
+    type: double
+    restore_value: no
+    initial_value: '18.0'
+  - id: hum_mold_counter
+    type: double
+    restore_value: no
+    initial_value: '0.0'
+  - id: hum_kickstart_counter
+    type: double
+    restore_value: no
+    initial_value: '0'
+  - id: hum_stopped_counter
+    type: double
+    restore_value: no
+    initial_value: '0'
+  - id: hum_sticky_counter
+    type: double
+    restore_value: no
+    initial_value: '0'
+  - id: hum_speed_prev
+    type: double
+    restore_value: no
+    initial_value: '0.0'
+  # maximal allowed fan speed
+  - id: hum_speed_max
+    type: double
+    restore_value: no
+    initial_value: '0.0'
+  - id: hum_inefficient_warning
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: hum_mileage
+    type: uint32_t
+    restore_value: yes
+    initial_value: '0'
+
+  - id: blinker_state
+    type: bool
+    restore_value: no
+    initial_value: 'true'
+  - id: blinker_request_update
+    type: bool
+    restore_value: no
+    initial_value: 'true'
+  - id: ota_in_progress
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: first_boot
+    type: bool
+    restore_value: yes
+    initial_value: 'true'
+  - id: guard_buzzer_chime
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: guard_adc_measurement
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: ext_hum
+    type: double
+    restore_value: no
+    initial_value: 'NAN'
+  - id: ext_temp
+    type: double
+    restore_value: no
+    initial_value: 'NAN'
+  - id: air_oversaturated
+    type: bool
+    initial_value: 'false'
+    
+sensor:
+  - platform: template
+    id: fan_speed_smooth
+    update_interval: 0.5s
+    unit_of_measurement: "%"
+    accuracy_decimals: 5
+    internal: true
+    filters:
+      - exponential_moving_average:
+          alpha: 0.075
+          send_every: 1
+      - lambda: |-
+          if(id(guard_buzzer_chime)) return x;
+          id(set_momentary_speed)->execute();
+          if(x >= 7.0) id(hum_mileage) += x;
+          return x;
+    lambda: return std::min(100.0, (double)id(hum_speed_prev));
+
+  - platform: homeassistant
+    id: hass_hum
+    entity_id: ${attach_hum_sensor}
+    filters:
+      - filter_out: 0
+      - filter_out: NaN
+    on_value:
+      - then:
+          - lambda: |-
+              id(update_ext_hum)->execute(1);
+  - platform: homeassistant
+    id: hass_temp
+    entity_id: ${attach_temp_sensor}
+    filters:
+      - filter_out: 0
+      - filter_out: NaN
+    on_value:
+      - then:
+          - lambda: |-
+              id(update_ext_temp)->execute(1);
+
+  - platform: template
+    name: "Fan speed"
+    id: dashboard_fanspeed
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+  - platform: template
+    name: "Efficiency"
+    id: efficiency
+    update_interval: 2s
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    filters:
+      - sliding_window_moving_average:
+          window_size: 3
+          send_every: 1
+          send_first_at: 1
+  - platform: template
+    name: "Efficiency (10 min)"
+    id: efficiency_10min
+    update_interval: 30s
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    filters:
+      - sliding_window_moving_average:
+          window_size: 20
+          send_every: 10
+          send_first_at: 10
+    lambda: return id(efficiency).state;
+  - platform: template
+    id: dry_air_temperature
+    #update_interval: 5s
+    internal: true
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    filters:
+      - sliding_window_moving_average:
+              window_size: 20
+              send_every: 1
+              send_first_at: 1
+
+  - platform: dht
+    pin: D6
+    temperature:
+      id: exhaust_temperature 
+      internal: true 
+      accuracy_decimals: 2
+      filters:
+        - filter_out: 0
+        - filter_out: NaN
+        - offset: +1.0
+        - sliding_window_moving_average:
+            window_size: 3
+            send_every: 1
+            send_first_at: 1
+        - exponential_moving_average:
+            alpha: 0.4
+            send_every: 1
+            send_first_at: 1
+        - filter_out: 0
+    update_interval: 2s
+  - platform: adc
+    pin: A0
+    name: "Water level"
+    id: waterlevel_voltage
+    update_interval: 4294967295ms
+    unit_of_measurement: "V"
+    accuracy_decimals: 2
+    filters:
+      - sliding_window_moving_average:
+          window_size: 5
+          send_every: 5
+      - lambda: |-
+          ESP_LOGI("water", "RAW=%.3fV", x);
+          return x;
+  - platform: uptime
+    id: esp_uptime
+    internal: true
+    update_interval: 1s
+      
+
+text_sensor:
+  - platform: template
+    name: "Uptime"
+    update_interval: 10s
+    lambda: |-
+      if(isnan(id(esp_uptime).state)) return {};
+      uint32_t secs = id(esp_uptime).state;
+      uint16_t days = floor(secs / 86400);
+      secs -= days * 86400;
+      uint16_t hours = floor(secs / 3600);
+      secs -= hours * 3600;
+      uint16_t mins = floor(secs / 60);
+      secs -= mins * 60;
+      
+      //return format("{:d} d {:02d}:{:02d}:{:02d}", days, hours, mins, secs);
+      auto format = "%d d %02d:%02d";
+      auto size = std::snprintf(nullptr, 0, format, days, hours, mins, secs);
+      std::string output(size + 1, '\0');
+      std::sprintf(&output[0], format, days, hours, mins, secs);
+      return {output};
+  - platform: template
+    name: "SALON Nawilżacz (status)"
+    id: modeTextSensor
+    
+
+output:
+  - platform: esp8266_pwm
+    pin: D1
+    frequency: 50 Hz
+    id: fan_pwm_output
+  - platform: template
+    id: led_indicator_g
+    type: float
+    write_action: []
+  - platform: esp8266_pwm
+    id: led_indicator_r
+    pin: D5
+    frequency: 500Hz
+    inverted: false
+  - platform: esp8266_pwm
+    id: led_indicator_b
+    pin: D7
+    frequency: 500Hz
+    inverted: false
+  - platform: gpio
+    pin: D2
+    id: waterlevel_sensor_power_supply
+    
+fan:
+  - platform: speed
+    id: fan_control
+    output: fan_pwm_output
+    speed_count: 500
+    internal: true
+    
+number:
+  - platform: template 
+    id: setting_humidity
+    name: "Humidity set"
+    unit_of_measurement: "%"
+    optimistic: true
+    min_value: 30
+    max_value: 70
+    initial_value: 50
+    restore_value: true
+    step: 1
+    on_value:
+      then:
+        - lambda: |-
+            id(hum_pid_params_changed) = true;
+            id(blinker_request_update) = true;
+            id(chime_feedback)->execute();
+            
+  - platform: template 
+    id: setting_boost
+    name: "Speed boost"
+    optimistic: true
+    min_value: 0
+    max_value: 10
+    initial_value: 3
+    restore_value: true
+    step: 1
+    on_value:
+      then:
+        - lambda: |-
+            id(hum_pid_params_changed) = true;
+
+switch:
+  - platform: template
+    name: "Power switch"
+    id: power_switch
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      then:
+        - lambda: |-
+            id(hum_pid_params_changed) = true;
+            id(blinker_request_update) = true;
+            id(chime_feedback)->execute();
+    on_turn_off:
+      then:
+        - lambda: |-
+            id(hum_pid_params_changed) = true;
+            id(blinker_request_update) = true;
+            id(chime_feedback)->execute();
+  - platform: template
+    name: "Drying"
+    id: switch_dehumidify
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    on_turn_on:
+      then:
+        - lambda: |-    
+            id(hum_drying_mode) = 9;
+  - platform: template
+    name: "Night time"
+    id: switch_nighttime
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: template
+    name: "Do not disturb mode"
+    id: switch_dnd
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: template
+    name: "Enable lights"
+    id: setting_enable_blinkenlights
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+  - platform: template
+    name: "Enable sounds"
+    id: setting_enable_buzzer
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON   
+    
+interval:
+  - interval: 1s
+    then:
+        - lambda: |-
+            id(state_machine_routine)->execute();
+            if(id(hum_mode)==9){
+              id(full_drying_routine)->execute();
+            }
+            id(update_mode_text)->execute();
+
+          
+  - interval: 10s
+    then:
+        - lambda: |-
+            double motorSpeed = id(fan_speed_smooth).state;
+
+            if(motorSpeed==0.0){
+              id(hum_stopped_counter)+=10;
+            }else{
+              id(hum_stopped_counter) = 0;
+            } 
+
+            //   dry detection
+            if(id(hum_inefficient_warning)){
+                id(hum_dry_counter) = std::max(id(hum_dry_counter)-(motorSpeed/50.0), -6.0);
+            }else{
+                id(hum_dry_counter) = std::min(id(hum_dry_counter)+(motorSpeed/25.0), 18.0);
+            }
+
+            // FULL DRYING OVERRIDE
+            if(id(hum_mode)==9){
+              id(hum_cooldown_counter) -= 10.0;
+              id(hum_warmup_counter) -= 10.0;
+              id(hum_saturation_counter) -= 10.0;
+
+              id(hum_watertank_alert).publish_state(false);
+              id(hum_mold_alert).publish_state(false);
+              id(hum_dry_alert).publish_state(false);
+              return;
+            }
+
+            id(air_oversaturated) = id(hum_pid_error) <= -8.0 || id(ext_hum)>64.0;
+            id(hum_watertank_alert).publish_state(id(waterlevel_voltage).state<0.15 && !id(air_oversaturated));
+
+            
+            id(hum_mold_alert).publish_state(id(waterlevel_voltage).state>0.1 && id(air_oversaturated));
+                  
+                        
+            // COUNTERS
+            switch(id(hum_mode)){
+              case 0: // OFF
+              case 2: // STOPPED_PID
+              case 3: // COOLDOWN
+              case 5: // STOPPED_DRY
+                
+                id(hum_cooldown_counter) -= 10.0;
+                if(id(hum_cooldown_counter)<0.0) id(hum_cooldown_counter) = 0.0;
+                id(hum_warmup_counter) = 180.0;
+                break;
+              case 8: // STOPPED_EMPTY
+                if(id(hum_watertank_alert).state) {
+                  break;
+                }
+                id(hum_cooldown_counter) = 0.0;
+                id(hum_warmup_counter) = 180.0;
+
+                break;
+              case 1: // RUNNING_PID
+              case 6: // KICKSTART
+             
+                id(hum_saturation_counter) = std::min(10800.0, id(hum_saturation_counter) - motorSpeed / 2.5 + 15.0);
+            
+                if(id(hum_warmup_counter)>0){ 
+                //   WARMUP
+                  id(hum_warmup_counter) -= 10.0;
+                  id(hum_saturation_counter) = 10800.0;
+                }else{
+                //   NORMAL RUN
+                  if(id(hum_saturation_counter)<=0){
+                    id(hum_cooldown_counter) = 600.0;
+                  }
+                  
+                  id(hum_dry_alert).publish_state(id(hum_dry_counter) <= 0);
+                  
+                  if(id(hum_dry_alert).state){
+                    //  filter is dry!!
+                    id(hum_cooldown_counter) = 900.0;
+                    
+                  }
+                  
+                }
+                break;
+            }
+
+            
+            
+            //id(hum_request_update)=true;
+  - interval: 15s
+    then:
+      - if:
+          condition:
+            lambda: 'return (id(hum_cooldown_counter)<=0 && id(hum_warmup_counter)<=0) || id(hum_dry_alert).state || id(hum_mode)==2 ;'
+          then:
+            - script.execute: update_waterlevel 
+  - interval: 120s
+    then:
+      - script.execute: update_waterlevel 
+
+  #BLINKER 
+  #trigger interval
+  - interval: 2s
+    then:
+      - lambda: |-
+          id(blinker_request_update) = true;
+          id(blinker_state) = !id(blinker_state);
+  #control interval
+  - interval: 0.25s
+    then:
+      - lambda: |-
+          if(!id(blinker_request_update) || id(guard_buzzer_chime)) return;
+          if(id(ota_in_progress)) return;
+          
+          id(blinker_request_update) = false;
+          
+          double maxBrightness = 1.0, lightR = 0.0, lightB = 0.0;
+          bool isBlinking = false, isRunning = (id(hum_mode) == 2 || id(hum_mode) == 4);
+
+          bool waterWarning = id(waterlevel_voltage).state<0.19;
+          
+          
+          if(id(switch_dnd).state){
+            maxBrightness = 0;
+          }else if(id(switch_nighttime).state){ // nighttime
+            maxBrightness = 0.2;
+            id(led_indicator_r).set_frequency(100.0);
+            id(led_indicator_b).set_frequency(100.0);
+          }else{
+            id(led_indicator_r).set_frequency(900.0);
+            id(led_indicator_b).set_frequency(500.0);
+
+          }
+          
+          auto lightCall = id(led_indicator).make_call();
+          //lightCall.set_color_mode(ColorMode::RGB);
+          lightCall.set_effect(0);
+          
+          if(id(hum_mode)==7) {
+            //OFFLINE
+            lightCall.set_effect("PulseDisconnected");
+            lightR = 1.0;
+            lightB = 0.0;
+            maxBrightness = 0.7;
+          }
+          else if(id(hum_mode)==0) {
+            // ONLINE & POWER OFF
+            lightR = 1.0;
+            maxBrightness = std::min(maxBrightness, 0.4);
+          }
+          else if(id(hum_mode)==8) { // red ring of FILL-ME-UP
+            lightR = 1.0;
+            isBlinking = true;
+          }
+          else if(id(hum_mode)==5) { // filter wetting pause
+            lightB=1.0;
+            lightR=0.3;
+            isBlinking=true;
+          }
+          else if(id(hum_mode)==9) { // MOLD_FULL_DRYING
+            switch(id(hum_drying_mode)){
+              case 1: //DRYING_RUNNING
+              case 2: //DRYING_DELAYED_FINISHING
+              case 3: //DRYING_COOLDOWN               
+                lightCall.set_effect("PulseDrying");
+                break;
+              case 0: //DRYING_DONE
+                lightB=0.6; 
+                isBlinking = false;
+                break;
+            }
+          }
+          else {
+            lightB = 0.75;
+            if(id(hum_mode)==1 || id(hum_mode)==4 || id(hum_mode)==6 || id(hum_mode)==3 || id(hum_mode)==8){
+              isBlinking = true;
+              if(id(setting_enable_blinkenlights).state){
+                lightR = std::min(std::max((id(hum_pid_error)-0.8)*0.3,0.0),0.7);
+              }
+            } 
+            else {
+
+              maxBrightness = std::min(maxBrightness, 0.4);
+
+              if(waterWarning) {
+                lightR = 0.85;
+              }
+            }
+          } 
+          
+
+          if(id(hum_mold_alert).state){
+            lightCall.set_effect("PulseMold");
+          }
+          
+          lightCall.set_state(maxBrightness > 0);
+          if(maxBrightness > 0){
+            if(isBlinking && id(setting_enable_blinkenlights).state){
+              if(id(blinker_state)){
+                //lightCall.set_brightness(maxBrightness * max(0.4, (100.0-id(efficiency).state) / 100.0));
+                lightCall.set_brightness(maxBrightness * min(0.4, (id(fan_speed_smooth).state) / 50.0 * 0.4));
+              }else{
+                lightCall.set_brightness(maxBrightness);
+
+                if(waterWarning){
+                  lightR = 0.85;
+                }
+              }
+            }else{
+              lightCall.set_brightness(maxBrightness);
+            }
+          }
+          
+          lightCall.set_rgb(lightR, 0.0, lightB);
+          
+          lightCall.perform();
+
+binary_sensor:
+  - platform: template
+    name: "SALON Nawilżacz alert wody"
+    id: hum_dry_alert
+  - platform: template
+    name: "SALON Nawilżacz alert poziomu"
+    id: hum_watertank_alert
+  - platform: template
+    name: "SALON Nawilżacz alert wilgotności"
+    id: hum_mold_alert
+  - platform: gpio
+    pin: 
+      number: D3
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    name: "SALON Nawilżacz (pstryczek)"
+    internal: true
+    filters:
+      - delayed_off: 50ms
+      
+    on_click:
+    - min_length: 50ms
+      max_length: 350ms
+      then:
+        - script.execute: button_onoff
+    - min_length: 1000ms
+      max_length: 5000ms
+      then:
+        - script.execute: button_reset
+
+light:
+  - platform: rgb
+    name: "Indicator LED"
+    id: led_indicator
+    internal: true
+    red: led_indicator_r
+    green: led_indicator_g
+    blue: led_indicator_b
+    default_transition_length: 2s
+    effects:
+      - strobe:
+          name: "PulseDisconnected"
+          colors:
+            - state: true
+              brightness: 50%
+              red: 100%
+              green: 0%
+              blue: 0%
+              duration: 63ms
+            - state: true
+              duration: 62ms
+              brightness: 25%
+              red: 100%
+              green: 0%
+              blue: 0%
+      - strobe:
+          name: "PulseMold"
+          colors:
+            - state: true
+              brightness: 50%
+              red: 40%
+              green: 0%
+              blue: 100%
+              duration: 750ms
+            - state: true
+              duration: 750ms
+              brightness: 10%
+              red: 100%
+              green: 0%
+              blue: 0%
+      - strobe:
+          name: "PulseDrying"
+          colors:
+            - state: true
+              brightness: 50%
+              red: 20%
+              green: 0%
+              blue: 100%
+              duration: 850ms
+            - state: true
+              duration: 850ms
+              brightness: 50%
+              red: 80%
+              green: 0%
+              blue: 100% 
+      - strobe:
+          name: "StrobeFeedback"
+          colors:
+            - state: true
+              brightness: 100%
+              red: 100%
+              green: 0%
+              blue: 100%
+              duration: 40ms
+            - state: false
+              duration: 50ms
+            - state: true
+              brightness: 100%
+              red: 100%
+              green: 0%
+              blue: 0%
+              duration: 40ms
+            - state: false
+              duration: 300ms
+script:
+  - id: state_machine_routine
+    then:
+      - lambda: |-
+          double speed = id(hum_speed_prev), speed_max; // [0-100]
+          int newMode = 0;
+          
+          if(std::isnan(speed)) speed = 0.0;
+          if(!id(hass_api)->is_connected()){
+            id(hum_mode) = 7; // OFFLINE
+            return;
+          }else if(std::isnan(id(ext_hum))) {
+            id(hum_mode) = 0;
+            return;
+          }
+
+          id(update_speed_limit)->execute();
+          speed_max = id(hum_speed_max);
+
+          id(update_efficiency)->execute();
+
+          // COUNTERS
+          id(hum_kickstart_counter)--;
+          id(hum_interval_counter)++;
+
+          bool initialKickstart = false;
+
+          if(id(switch_dehumidify).state){
+            id(hum_mode) = 9; // MOLD_FULL_DRYING
+            return;
+          }
+          
+          // PID ERROR
+          id(hum_pid_error) = id(setting_humidity).state - id(ext_hum);
+          
+
+                      
+          
+          if(id(hum_pid_params_changed)){
+            id(hum_pid_integral) += (id(hum_pid_error) - id(hum_pid_error_prev))*5.0;
+            id(hum_pid_error_prev) = id(hum_pid_error); // avoid huge D-term response
+            id(hum_pid_params_changed) = false;
+            id(hum_request_update) = true;
+            id(hum_sticky_counter) = 0;
+            //id(hum_pid_integral) /= 3.0;
+          }
+                    
+          if(id(hum_request_update) || id(hum_interval_counter)>=20){
+            id(hum_request_update) = false;
+            
+            
+            // BASIC PID
+            double pv, iv, dv;
+            pv = id(hum_pid_error) * 15.0; //id(hum_pid_term_p).state;
+            iv = id(hum_pid_integral) * 0.4; //id(hum_pid_term_i).state;
+            dv = (id(hum_pid_error) - id(hum_pid_error_prev)) * 40.0 *  10.0 / id(hum_interval_counter);
+            double speedUncapped = pv + iv + dv;
+            
+            // TURBO BOOST
+            speedUncapped *= 1 + id(setting_boost).state*0.06;
+            
+            
+            speed = std::min(speedUncapped, speed_max);
+            
+            if(speed < 3.0) speed = 0.0;
+            
+            // STICKY COUNTER prevents frequent run-stop state switching
+            // >0 - running, <0 - stopped, = 0 - free to change
+            if(id(hum_sticky_counter) > 0){ // RUNNING
+              id(hum_sticky_counter) = max(id(hum_sticky_counter) - id(hum_interval_counter), 0.0);
+              speed = max(speed, 10.0);
+            }else if(id(hum_sticky_counter) < 0){ // STOPPED
+              id(hum_sticky_counter) = min(id(hum_sticky_counter) + id(hum_interval_counter), 0.0);
+              speed = 0.0;
+            }else{ // FREE TO CHANGE
+              bool runStateChanged = (speed != 0) != (id(hum_speed_prev) != 0);
+              if(runStateChanged){
+                if(speed == 0) {
+                  id(hum_sticky_counter) = -60.0;
+                } else {
+                  id(hum_sticky_counter) = 60.0;
+                }
+              }
+            }
+            
+            if(speed > 0.0 && speed<10.0) {
+              speed = 10.0;
+            }
+            
+            initialKickstart = (speed > 0.0 && id(hum_speed_prev) == 0.0);
+            
+            
+            if(initialKickstart){ // MOTOR START
+              id(hum_kickstart_counter) = 0;
+              id(hum_warmup_counter) = 180;
+              
+            }
+            
+            id(hum_pid_integral) = std::max(-25.0,std::min(125.0, id(hum_pid_integral) + id(hum_pid_error)*0.1 * id(hum_interval_counter)));
+            id(hum_interval_counter) = 0;
+            id(hum_pid_error_prev) = id(hum_pid_error);
+            ESP_LOGI("interval", "S(%.2f) = %.2f(P) + %.2f(I) + %.2f(D)", speed, pv, iv, dv);
+          }
+          
+          //SET MODE
+          if(!id(power_switch).state){
+            newMode = 0; // OFF
+          }else if(id(hum_mold_counter)<0){ // mold counter is negative - force airflow
+            newMode = 4; // MOLD
+          }else if(id(hum_cooldown_counter)>0 && id(hum_dry_counter) <= 0){ // no efficiency detected
+            if(id(hum_watertank_alert).state){
+              newMode = 8; // STOPPED_EMPTY
+            }else{
+              newMode = 5; // STOPPED_DRY
+            }
+          }else if(id(hum_cooldown_counter)>0){ // there's a countdown going on (cooldown or empty tank break)
+            newMode = 3; // COOLDOWN
+          }else if(speed>0.0){
+            newMode = 1; // RUNNING_PID              
+          }else{
+            newMode = 2; // STOPPED_PID
+          }
+
+          //kickstart 
+          id(kickstart) = (speed>0.0 && id(hum_kickstart_counter) <= 0 && (initialKickstart || id(hum_inefficient_warning)));
+
+          
+          
+          // MOLD PROTECTION
+          double airMoldity = max(0.0, -id(hum_pid_error) * 0.1);
+          //   counter
+          if(newMode!=4){
+            if(!id(hum_dry_alert).state || !id(hum_watertank_alert).state){
+              id(hum_mold_counter) = std::max(0.0, id(hum_mold_counter) + 1.0 + airMoldity - speed/10.0);
+            }
+          }else{
+            //   motor override
+            if(id(switch_dnd).state){
+              speed = 10.0;
+            }else{
+              speed = speed_max;
+            }
+            id(hum_dry_counter) = 18.0;
+            id(hum_mold_counter) += min(0.8, speed / min(80.0, 50.0 + airMoldity * 10.0));
+            id(hum_sticky_counter) = 0;
+
+          }
+          if(id(hum_mold_counter)>1800.0 && newMode!=0){
+            id(hum_mold_counter) = -240.0;
+          }
+          
+          if(newMode == 0 || newMode == 3 || newMode == 5 || newMode == 7 || newMode == 8){ // disable motor for off-modes
+            speed = 0.0;
+          }
+          
+         
+          //SET PWM
+          //id(fan_speed_smooth).publish_state(speed);
+          id(dashboard_fanspeed).publish_state(round(speed/5.0)*5.0);
+          id(hum_speed_prev) = speed;
+          
+          // empty tank beep+measure water level (every 3 sec)
+          if(newMode==8){
+            if((int)id(esp_uptime).state % 3 == 0 && !id(air_oversaturated))
+              id(chime_error)->execute();
+            if((int)id(esp_uptime).state % 3 == 1)
+              id(update_waterlevel)->execute();
+          }
+
+          //sound notifications every minute
+          if((int)id(esp_uptime).state % 60 == 0){
+            // tank low level beep
+            if(newMode!=0 && newMode!=8 && newMode!=9 && newMode!=10 && id(hum_watertank_alert).state && !id(air_oversaturated)){
+              id(chime_error_double)->execute();
+            }
+            // humidity high while tank is full alert (every minute)
+            /*if(newMode!=0 && newMode!=8 && id(hum_mold_alert).state){
+              id(chime_mold)->execute();
+            }*/
+          }
+          
+          ESP_LOGI("MODE", "hum_mode=%d warm=%.01f sat=%.01f cool=%.01f kick=%.01f dry=%.01f mold=%.01f MILEAGE=%d", 
+            newMode, id(hum_warmup_counter), id(hum_saturation_counter), id(hum_cooldown_counter), id(hum_kickstart_counter), id(hum_dry_counter), id(hum_mold_counter), id(hum_mileage));
+        
+          if(newMode != id(hum_mode)){
+            id(hum_mode) = newMode;
+          }
+  - id: full_drying_routine
+    then:
+      - lambda: |-
+          int newDryingMode = id(hum_drying_mode);
+          double speed = 0.0;
+          bool isWaterInTank = id(waterlevel_voltage).state>0.1;
+
+          switch(id(hum_drying_mode)){ 
+            case 9: // DRYING_INIT 
+              newDryingMode = 1;
+              break;
+            case 1: // DRYING_RUNNING
+              speed = id(hum_speed_max);
+
+              if(id(hum_warmup_counter)>0){ 
+              //   WARMUP
+                id(hum_saturation_counter) = 30 * 60;
+              }else{
+              //   NORMAL RUN
+                if(id(hum_saturation_counter)<=0){
+                  id(hum_cooldown_counter) = 10 * 60;
+                  newDryingMode = 3; 
+                }
+                if(id(hum_dry_counter) <= 0 && !isWaterInTank){
+                  newDryingMode = 2; 
+                  id(hum_saturation_counter) = 30 * 60;
+                }
+              }
+
+              id(kickstart) = id(hum_kickstart_counter) <= 0 && id(hum_inefficient_warning);
+
+              break;
+            case 2: // DRYING_DELAYED_FINISHING
+              speed = min(35.0,id(hum_speed_max));
+              if(id(hum_saturation_counter) <= 0){
+                newDryingMode = 0; 
+              }
+              
+              if(isWaterInTank){
+                newDryingMode = 1;
+              }
+              break;
+            case 3: // DRYING_COOLDOWN 
+              if(id(hum_cooldown_counter)<0.0) 
+                newDryingMode = 1;
+                
+              break;
+            case 0:
+              if(isWaterInTank){
+                newDryingMode = 1;
+              }
+              break;
+
+          }
+
+          id(dashboard_fanspeed).publish_state(round(speed/5.0)*5.0);
+          id(hum_speed_prev) = speed;
+
+          if(newDryingMode==1 && id(hum_drying_mode)!=1){
+            id(hum_warmup_counter) = 180.0;
+            id(hum_dry_counter) = 18.0;
+          }
+
+          id(hum_drying_mode) = newDryingMode;
+
+          ESP_LOGI("DRYING_MODE", "hum_drying_mode=%d warm=%.01f sat=%.01f cool=%.01f kick=%.01f dry=%.01f MILEAGE=%d", 
+            newDryingMode, id(hum_warmup_counter), id(hum_saturation_counter), id(hum_cooldown_counter), id(hum_kickstart_counter), id(hum_dry_counter), id(hum_mileage));
+        
+
+  - id: update_speed_limit
+    then:
+      - lambda: |-
+          double speed_max = 50.0;
+
+          // SPEED CAP
+          speed_max = 50.0 + id(setting_boost).state * 5.0;
+          if(id(switch_dnd).state){
+            speed_max = 0.0;
+          } 
+          if(id(switch_nighttime).state){
+            speed_max = min(speed_max, 25.0);
+          } 
+
+          id(hum_speed_max) = speed_max;
+  - id: update_efficiency
+    then:
+      - lambda: |-
+          // HUM DIFF
+          double tempRoom = id(ext_temp);
+          double tempHumidf = id(exhaust_temperature).state;
+          double humEff = (tempRoom - tempHumidf - id(dry_air_temperature).state) * 15;
+          double humEffBased = std::min(std::max(0.0, humEff), 100.0);
+
+          // EFFICIENCY CALC
+          double speed = id(hum_speed_prev);
+          if(speed==0.0){
+            if(id(hum_stopped_counter) >= 300) {
+              id(dry_air_temperature).publish_state(tempRoom-tempHumidf);
+              humEffBased = 0.0;
+            }
+          }
+          id(hum_inefficient_warning) = humEffBased * 3.0 <= min(50.0, speed);
+          id(efficiency).publish_state(humEffBased);
+
+  - id: update_ext_hum
+    parameters:
+      src_id: int
+    then:
+        - lambda: |-
+            id(ext_hum) = id(hass_hum).state;
+            id(hum_request_update) = true;
+  - id: update_ext_temp
+    parameters:
+      src_id: int
+    then:
+        - lambda: |-
+            id(ext_temp) = id(hass_temp).state;
+  - id: chime_error_double
+    then:
+     - repeat:
+        count: 2
+        then:
+          - script.execute: chime_error
+          - script.wait: chime_error
+
+  - id: chime_error
+    then:
+        - if:
+            condition:
+              lambda: "return id(setting_enable_buzzer).state && !id(switch_dnd).state && !id(switch_nighttime).state;"
+            then:
+              - lambda: |-
+                  id(guard_buzzer_chime) = true;
+                  //auto lightCall = id(led_indicator).make_call();
+                  //lightCall.set_effect("StrobeFeedback");
+                  //lightCall.perform();
+              - output.esp8266_pwm.set_frequency:
+                  id: fan_pwm_output
+                  #frequency: 932
+                  frequency: 949
+              - fan.turn_on:
+                  id: fan_control
+                  speed: 375
+              - delay: 100ms
+              - output.esp8266_pwm.set_frequency:
+                  id: fan_pwm_output
+                  frequency: 622
+                  #frequency: 739
+              - fan.turn_on:
+                  id: fan_control
+                  speed: 375
+              - delay: 100ms
+              - fan.turn_off: fan_control
+              - lambda: |-
+                  id(guard_buzzer_chime) = false;
+                  id(set_momentary_speed)->execute();
+                  //id(blinker_request_update) = true;
+                  //auto lightCall = id(led_indicator).make_call();
+                  //lightCall.set_effect(0);
+                  //lightCall.perform();
+  - id: chime_mold
+    then:
+        - if:
+            condition:
+              lambda: "return id(setting_enable_buzzer).state && !id(switch_dnd).state && !id(switch_nighttime).state;"
+            then:
+              - lambda: |-
+                  id(guard_buzzer_chime) = true;
+              - repeat:
+                  count: 3
+                  then:
+                    - output.esp8266_pwm.set_frequency:
+                        id: fan_pwm_output
+                        frequency: 622
+                    - fan.turn_on:
+                        id: fan_control
+                        speed: 375
+                    - delay: 100ms
+              - fan.turn_off: fan_control
+              - lambda: |-
+                  id(guard_buzzer_chime) = false;
+                  id(set_momentary_speed)->execute();
+  - id: chime_warning
+    then:
+      - if:
+          condition:
+            lambda: "return id(setting_enable_buzzer).state && !id(switch_dnd).state && !id(switch_nighttime).state;"
+          then:
+            - lambda: |-
+                id(guard_buzzer_chime) = true;
+            - output.esp8266_pwm.set_frequency:
+                id: fan_pwm_output
+                frequency: 1200
+            - repeat:
+                count: 4
+                then:
+                  - fan.turn_on:
+                      id: fan_control
+                      speed: 375
+                  - delay: 30ms
+                  - fan.turn_off: fan_control
+                  - delay: 20ms
+            - fan.turn_on:
+                id: fan_control
+                speed: 375
+            - delay: 150ms
+            - fan.turn_off: fan_control
+
+            - lambda: |-
+                id(guard_buzzer_chime) = false;
+                id(set_momentary_speed)->execute();
+                //id(blinker_request_update) = true;
+                //auto lightCall = id(led_indicator).make_call();
+                //lightCall.set_effect(0);
+                //lightCall.perform();
+  - id: chime_feedback
+    then:
+        - if:
+            condition:
+              lambda: "return id(setting_enable_buzzer).state && !id(switch_dnd).state && !id(switch_nighttime).state;"
+            then:
+              - lambda: |-
+                  id(guard_buzzer_chime) = true;
+                  auto lightCall = id(led_indicator).make_call();
+                  lightCall.set_effect("StrobeFeedback");
+                  lightCall.perform();
+              - output.esp8266_pwm.set_frequency:
+                  id: fan_pwm_output
+                  frequency: 1864
+              - fan.turn_on:
+                  id: fan_control
+                  speed: 375
+              - delay: 100ms
+              #- fan.turn_off: fan_control
+              #- delay: 100ms
+              - lambda: |-
+                  id(guard_buzzer_chime) = false;
+                  id(blinker_request_update) = true;
+                  id(set_momentary_speed)->execute();
+                  auto lightCall = id(led_indicator).make_call();
+                  lightCall.set_effect(0);
+                  lightCall.perform();
+                  
+  - id: button_reset
+    then:
+        - lambda: |-
+            id(blinker_request_update) = true;
+            id(hum_cooldown_counter) = 0;
+            id(hum_warmup_counter) = 300;
+            id(hum_dry_counter) = 25;
+            id(chime_feedback)->execute();
+            
+  - id: button_onoff
+    then:
+        - lambda: |-
+            id(blinker_request_update) = true;
+            id(power_switch).toggle();
+            id(chime_feedback)->execute();
+  - id: set_momentary_speed
+    then:
+      - lambda: |-
+          if(id(guard_adc_measurement)) return;
+
+          float newSpeed = id(fan_speed_smooth).state;    
+          float freq;
+          
+          auto call = id(fan_control).make_call();
+
+          if(id(kickstart)){ // kickstart
+            freq = 4.0;
+            call.set_speed(50.0 * 5.0);
+            id(hum_kickstart_counter) = 5.0;
+          }
+          else if(newSpeed >= 6.0){
+            freq = 20.0;
+          }
+          /* // values adjusted to my fan to prevent rattling noise:
+          else if(newSpeed >= 50.0){
+            freq = 20.0;
+          }
+          else if(newSpeed >= 25.0){
+            freq = 14.5 + (-0.35 + 0.01 * newSpeed) * newSpeed;
+          }
+          else if(newSpeed >= 6.0){
+            freq = -4.41 + (1.32 - 0.02 * newSpeed) * newSpeed;
+          }
+          */
+          else{ 
+            freq = 3.0; 
+            newSpeed = 5;
+          }
+          
+          id(fan_pwm_output).set_frequency(freq);
+          call.set_state(newSpeed > 5.0);
+          call.set_speed(newSpeed * 5.0);
+          call.perform();
+  - id: update_waterlevel
+    then:
+      - output.turn_on: waterlevel_sensor_power_supply
+      - globals.set: 
+          id: guard_adc_measurement
+          value: "true"
+      - fan.turn_off: fan_control
+      - delay: 50ms
+      - repeat:
+          count: 5
+          then:
+          - component.update: waterlevel_voltage
+          - delay: 10ms
+      - output.turn_off: waterlevel_sensor_power_supply
+      - globals.set: 
+          id: guard_adc_measurement
+          value: "false"
+      - script.execute: set_momentary_speed
+  - id: update_mode_text
+    then:
+      - lambda: |-
+          int newMode = id(hum_mode);
+          std::string modeText="nieznany";
+
+          switch(newMode){
+            case 0: // OFF
+              modeText="Wyłączony"; break;
+            case 1: // RUNNING_PID
+            case 6: // KICKSTART
+              modeText="Nawilżanie"; 
+              if(id(switch_nighttime).state){
+                modeText.append(" (cisza nocna)"); 
+              }
+
+              break;
+            case 2: // STOPPED_PID
+              if(id(switch_dnd).state)
+                modeText="Stop: cisza w domu";
+              else
+                modeText="Stop: powietrze nasycone";
+              break;
+            case 3: // COOLDOWN
+              modeText="Pauza: krótka przerwa"; break;
+            case 4: // MOLD
+              modeText="Wymuszone: wietrzenie p/w pleśni"; break;
+            case 5: // STOPPED_DRY
+              modeText="Pauza: kalibracja"; break;
+            case 7: // OFFLINE
+              modeText="Offline"; break;
+            case 8: // STOPPED_EMPTY
+              modeText="Stop: pusty zbiornik"; break;
+            case 9: // MOLD_FULL_DRYING
+              modeText="Osuszanie";
+              switch(id(hum_drying_mode)){
+                case 1: //DRYING_RUNNING
+                case 2: //DRYING_DELAYED_FINISHING
+                  break;
+                case 3: //DRYING_COOLDOWN               
+                  modeText.append(": przerwa - kalibracja"); break;
+                case 0: //DRYING_DONE
+                  modeText.append(": zakończone"); break;
+              }
+              break;
+            
+          }
+          
+          id(modeTextSensor).publish_state(modeText);
