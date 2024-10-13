@@ -1,13 +1,18 @@
 # Automatic cinema lights
 
 This automation activates a scene when playback on selected devices is started. 
-It also restores previous all the lights and states after the viewing.
+It also restores all the lights and states after the viewing.
 
 It works amazingly well with [Plex](https://www.home-assistant.io/integrations/plex/) home server.
 
-In the example I'll be using "Cinema lights" as a scene name.
+## Setup
+Things you need to prepare:
+1. Your media player's Entity ID (`media_player.plex_plex_web_firefox_windows_2`)
+2. List of all lights and entities that will be restored after the playback
+3. Your Cinema scene (`scene.cinema_lights`)
 
-Create two automations, changing your settings:
+
+Create two automations and paste the YAML code, changing your settings:
 ```yaml
 alias: "AutomaticCinemaLights - start"
 
