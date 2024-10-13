@@ -691,6 +691,7 @@ binary_sensor:
         pullup: true
       inverted: true
     internal: true
+    id: button_power
     filters:
       - delayed_off: 50ms
       
